@@ -1,0 +1,9 @@
+name = "news-worker"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[vars]
+# CORS — origins that may call the live /feeds endpoint from the browser
+# (e.g. Refresh button on /news). Build-time server-to-server fetches are
+# unaffected by CORS.
+ALLOWED_ORIGINS = "https://sajivfrancis.com,https://www.sajivfrancis.com,http://localhost:4321,http://localhost:4322"

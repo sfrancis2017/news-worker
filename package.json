@@ -1,0 +1,17 @@
+{
+  "name": "news-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker that aggregates curated RSS/Atom feeds for sajivfrancis.com/news",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240909.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.87.0"
+  }
+}
