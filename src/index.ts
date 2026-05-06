@@ -204,7 +204,7 @@ function jsonResponse(
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const origin = request.headers.get('Origin');
     const cors = corsHeaders(origin, env);
     const url = new URL(request.url);
@@ -227,11 +227,65 @@ export default {
           ? (domainParam as FeedDomain)
           : undefined;
 
+      // Edge cache via the explicit Cache API. Workers do NOT auto-cache
+      // based on Cache-Control headers alone — we have to write/read the
+      // cache ourselves. Cache key is the request URL (so domain= filter
+      // gets its own entry). On cache hit, response is <50ms.
+      //
+      // We strip CORS+Vary from the cached body and re-attach per-request
+      // (so a request from sajivfrancis.com doesn't get a cached response
+      // pinned to localhost or vice-versa).
+      const cache = caches.default;
+      const cacheUrl = new URL(request.url);
+      // Normalize: drop any future tracking params, keep only `domain`.
+      const norm = new URL(cacheUrl.origin + cacheUrl.pathname);
+      if (domain) norm.searchParams.set('domain', domain);
+      const cacheKey = new Request(norm.toString(), { method: 'GET' });
+
+      const cached = await cache.match(cacheKey);
+      if (cached) {
+        // Re-clothe the cached response with the live request's CORS headers
+        const body = await cached.text();
+        return new Response(body, {
+          status: cached.status,
+          headers: {
+            'Content-Type': 'application/json',
+            'Cache-Control': cached.headers.get('Cache-Control') ?? '',
+            'X-Cache': 'HIT',
+            ...cors,
+          },
+        });
+      }
+
       const items = await aggregate(domain);
-      return jsonResponse(
-        { items, fetchedAt: new Date().toISOString(), domain: domain ?? 'all' },
-        { cors, cache: true },
-      );
+      const payload = JSON.stringify({
+        items,
+        fetchedAt: new Date().toISOString(),
+        domain: domain ?? 'all',
+      });
+
+      // Cacheable copy: no CORS headers (re-added per-request above)
+      const cacheable = new Response(payload, {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control':
+            'public, max-age=0, s-maxage=3600, stale-while-revalidate=7200',
+        },
+      });
+      // Fire-and-forget cache write (don't block the live response)
+      ctx.waitUntil(cache.put(cacheKey, cacheable.clone()));
+
+      return new Response(payload, {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control':
+            'public, max-age=0, s-maxage=3600, stale-while-revalidate=7200',
+          'X-Cache': 'MISS',
+          ...cors,
+        },
+      });
     }
 
     return jsonResponse({ error: 'Not found' }, { status: 404, cors });
