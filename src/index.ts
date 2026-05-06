@@ -36,6 +36,7 @@ interface FeedItem {
   date: string;
   timestamp: number;
   excerpt?: string;
+  image?: string;
 }
 
 const VALID_DOMAINS: FeedDomain[] = ['SAP', 'Architecture', 'AI', 'Engineering'];
@@ -82,6 +83,35 @@ function extractLinkHref(xml: string): string {
   const inner = xml.match(/<link[^>]*>([^<]+)<\/link>/i);
   if (inner) return inner[1].trim();
   return '';
+}
+
+// Try several common patterns for a feed item's image URL. RSS and Atom
+// don't have a single canonical "thumbnail" element, so we probe in order
+// of typical reliability. Returns undefined if nothing usable found.
+function extractImage(chunk: string): string | undefined {
+  // Media RSS: <media:thumbnail url="..."> or <media:content url="..." medium="image">
+  const mediaThumb = chunk.match(/<media:thumbnail[^>]+url=["']([^"']+)["']/i);
+  if (mediaThumb) return mediaThumb[1];
+  const mediaContent = chunk.match(
+    /<media:content[^>]+url=["']([^"']+)["'][^>]*medium=["']image["']/i,
+  );
+  if (mediaContent) return mediaContent[1];
+  const mediaContentAlt = chunk.match(
+    /<media:content[^>]+medium=["']image["'][^>]*url=["']([^"']+)["']/i,
+  );
+  if (mediaContentAlt) return mediaContentAlt[1];
+
+  // Enclosure: <enclosure url="..." type="image/...">
+  const enclosure = chunk.match(
+    /<enclosure[^>]+url=["']([^"']+)["'][^>]*type=["']image\//i,
+  );
+  if (enclosure) return enclosure[1];
+
+  // Inline <img src="..."> in description / content / summary
+  const img = chunk.match(/<img[^>]+src=["']([^"']+)["']/i);
+  if (img) return img[1];
+
+  return undefined;
 }
 
 function decodeEntities(str: string): string {
@@ -138,6 +168,8 @@ async function parseFeed(source: FeedSource): Promise<FeedItem[]> {
         ? decodeEntities(rawExcerpt).replace(/\s+/g, ' ').slice(0, 220).trimEnd() + '…'
         : undefined;
 
+      const image = extractImage(chunk);
+
       items.push({
         id: `${source.id}::${url}`,
         title,
@@ -147,6 +179,7 @@ async function parseFeed(source: FeedSource): Promise<FeedItem[]> {
         date: parsed.toISOString(),
         timestamp: parsed.getTime(),
         excerpt,
+        image,
       });
     }
 
@@ -235,10 +268,15 @@ export default {
       // We strip CORS+Vary from the cached body and re-attach per-request
       // (so a request from sajivfrancis.com doesn't get a cached response
       // pinned to localhost or vice-versa).
+      //
+      // CACHE_VERSION baked into the cache key lets us bust all cached
+      // responses by bumping it whenever the response shape changes
+      // (e.g. when adding new fields like `image`).
+      const CACHE_VERSION = 'v2';
       const cache = caches.default;
       const cacheUrl = new URL(request.url);
-      // Normalize: drop any future tracking params, keep only `domain`.
       const norm = new URL(cacheUrl.origin + cacheUrl.pathname);
+      norm.searchParams.set('_v', CACHE_VERSION);
       if (domain) norm.searchParams.set('domain', domain);
       const cacheKey = new Request(norm.toString(), { method: 'GET' });
 
