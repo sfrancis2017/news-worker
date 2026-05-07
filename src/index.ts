@@ -9,6 +9,9 @@
 //   GET /health                — { ok: true, sources: <count> }
 //   GET /feeds                 — all sources merged
 //   GET /feeds?domain=AI       — filter to one domain
+//   POST /compose              — owner-only Anthropic-backed draft
+//                                generation for the /admin/share tool
+//                                on sajivfrancis.com
 //
 // CORS: build-time server-to-server fetches are unaffected. The /news
 // page's Refresh button calls this from the browser, so we whitelist
@@ -16,6 +19,28 @@
 
 interface Env {
   ALLOWED_ORIGINS: string;
+  // Owner-only bearer token gating /compose. Set via:
+  //   wrangler secret put COMPOSE_TOKEN
+  COMPOSE_TOKEN?: string;
+  // Anthropic API key for /compose calls. Set via:
+  //   wrangler secret put ANTHROPIC_API_KEY
+  ANTHROPIC_API_KEY?: string;
+  ANTHROPIC_MODEL?: string;
+}
+
+// Constant-time string compare for token check (avoids timing attacks)
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return mismatch === 0;
+}
+
+function isAuthorized(req: Request, env: Env): boolean {
+  if (!env.COMPOSE_TOKEN) return false;
+  const auth = req.headers.get('Authorization') ?? '';
+  const m = auth.match(/^Bearer\s+(.+)$/);
+  return m ? timingSafeEqual(m[1], env.COMPOSE_TOKEN) : false;
 }
 
 type FeedDomain = 'SAP' | 'Architecture' | 'AI' | 'Engineering';
@@ -208,8 +233,8 @@ function corsHeaders(origin: string | null, env: Env): Record<string, string> {
   const allowOrigin = origin && allowed.includes(origin) ? origin : allowed[0];
   return {
     'Access-Control-Allow-Origin': allowOrigin,
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
   };
@@ -324,6 +349,102 @@ export default {
           ...cors,
         },
       });
+    }
+
+    if (url.pathname === '/compose') {
+      if (request.method !== 'POST') {
+        return jsonResponse({ error: 'Method not allowed' }, { status: 405, cors });
+      }
+      if (!isAuthorized(request, env)) {
+        return jsonResponse({ error: 'Owner-only endpoint' }, { status: 401, cors });
+      }
+      if (!env.ANTHROPIC_API_KEY) {
+        return jsonResponse({ error: 'Anthropic key not configured' }, { status: 500, cors });
+      }
+
+      let body: {
+        url?: string;
+        title?: string;
+        source?: string;
+        commentary?: string;
+      };
+      try {
+        body = await request.json();
+      } catch {
+        return jsonResponse({ error: 'Invalid JSON' }, { status: 400, cors });
+      }
+      if (!body.url || !body.title) {
+        return jsonResponse(
+          { error: 'url and title are required' },
+          { status: 400, cors },
+        );
+      }
+      // Cap input sizes
+      if (body.url.length > 1000 || body.title.length > 500 || (body.commentary ?? '').length > 4000) {
+        return jsonResponse({ error: 'Request payload too large' }, { status: 400, cors });
+      }
+
+      const prompt = `You are helping Sajiv Francis (Enterprise Architect at a Fortune 50 technology company) compose social media posts about an article he wants to share. Sajiv writes as a credible practitioner — thoughtful, honest, opinionated. Not corporate-speak.
+
+Article to share:
+- Title: ${body.title}
+- Source: ${body.source ?? 'unknown'}
+- URL: ${body.url}
+
+Sajiv's commentary (incorporate as the lead/POV — this is the value he adds beyond just sharing the link):
+${body.commentary?.trim() || '(none — write a thoughtful summary instead)'}
+
+Generate two posts. Return ONLY valid JSON with no markdown fences and no preamble:
+{
+  "x": "...",
+  "linkedin": "..."
+}
+
+Rules:
+- "x": X / Twitter post. MAX 280 chars total INCLUDING the URL. Lead with the take. Plain text. URL at the end. No hashtag spam.
+- "linkedin": LinkedIn post. 800-1500 chars. Professional but human. Lead with the take, expand briefly, link at the end. Allow paragraph breaks (use \\n\\n). At most one short hashtag block at the end if it actually fits the topic; usually skip.
+- NEVER name a specific employer. Use "Fortune 50 technology company" if referring to current role.
+- No "Excited to share..." or "Thrilled to..." openings — they read as performative.
+- The commentary IS the post's value. Don't bury it under summary boilerplate.
+- One sparingly used emoji is fine; none is also fine. No emoji rows.`;
+
+      try {
+        const res = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': env.ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify({
+            model: env.ANTHROPIC_MODEL ?? 'claude-sonnet-4-6',
+            max_tokens: 2000,
+            system:
+              'You always respond with pure valid JSON only — no markdown fences, no preamble, no trailing text. Just the JSON object.',
+            messages: [{ role: 'user', content: prompt }],
+          }),
+        });
+        if (!res.ok) {
+          const errText = await res.text();
+          return jsonResponse(
+            { error: `Anthropic ${res.status}`, detail: errText.slice(0, 300) },
+            { status: 502, cors },
+          );
+        }
+        const data = (await res.json()) as { content?: { text?: string }[] };
+        const text = (data?.content?.[0]?.text ?? '').replace(/```json|```/g, '').trim();
+        const parsed = JSON.parse(text) as { x?: string; linkedin?: string };
+        if (!parsed.x || !parsed.linkedin) {
+          throw new Error('Model output missing x or linkedin field');
+        }
+        return jsonResponse({ x: parsed.x, linkedin: parsed.linkedin }, { cors });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unknown error';
+        return jsonResponse(
+          { error: 'Generation failed', detail: message },
+          { status: 502, cors },
+        );
+      }
     }
 
     return jsonResponse({ error: 'Not found' }, { status: 404, cors });
